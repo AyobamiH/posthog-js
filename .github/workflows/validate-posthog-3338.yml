@@ -1,0 +1,41 @@
+name: Validate PostHog #3338
+
+on:
+  push:
+    branches:
+      - validate/posthog-3338
+
+permissions:
+  contents: read
+
+jobs:
+  react-native:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact PR source
+        uses: actions/checkout@v4
+        with:
+          ref: 7fcc07bf14b88cb451eb9947e38e3d0cfa0b3ca2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint React Native package
+        run: pnpm --filter=posthog-react-native lint
+
+      - name: Test React Native package
+        run: pnpm --filter=posthog-react-native test
+
+      - name: Build React Native package
+        run: pnpm --filter=posthog-react-native build
