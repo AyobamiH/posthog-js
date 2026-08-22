@@ -15,7 +15,7 @@ jobs:
       - name: Checkout exact PR source
         uses: actions/checkout@v4
         with:
-          ref: 7fcc07bf14b88cb451eb9947e38e3d0cfa0b3ca2
+          ref: 2f61b375cd3526b2fc3c7a4862be5aba0798c28b
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
