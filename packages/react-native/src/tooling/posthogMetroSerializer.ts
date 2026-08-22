@@ -2,13 +2,23 @@
 // Copyright (c) 2017 Sentry
 // Licensed under the MIT License: https://github.com/getsentry/sentry-react-native/blob/main/LICENSE.md
 
+import * as crypto from 'crypto'
 // eslint-disable-next-line import/no-extraneous-dependencies
 import type { MixedOutput, Module, ReadOnlyGraph } from 'metro'
-import type { MetroSerializer, MetroSerializerOutput, SerializedBundle, VirtualJSOutput } from './utils'
-import { createDebugIdSnippet, createVirtualJSModule, determineDebugIdFromBundleSource, prependModule } from './utils'
+import type { Bundle, MetroSerializer, MetroSerializerOutput, SerializedBundle, VirtualJSOutput } from './utils'
+import {
+  createDebugIdSnippet,
+  createVirtualJSModule,
+  determineDebugIdFromBundleSource,
+  prependModule,
+  stringToUUID,
+} from './utils'
 import { createDefaultMetroSerializer } from './vendor/metro/utils'
 
 type SourceMap = Record<string, unknown>
+type PostHogSerializerOptions = Parameters<MetroSerializer>[3] & {
+  posthogBundleCallback?: (bundle: Bundle) => Bundle
+}
 
 const DEBUG_ID_PLACE_HOLDER = '__POSTHOG_CHUNK_ID__'
 const DEBUG_ID_MODULE_PATH = '__chunkid__'
@@ -69,17 +79,26 @@ export const createPostHogMetroSerializer = (customSerializer?: MetroSerializer)
     }
 
     const debugIdModule = createDebugIdModule(DEBUG_ID_PLACE_HOLDER)
+    const serializerOptions = options as PostHogSerializerOptions
+    serializerOptions.posthogBundleCallback = createPostHogBundleCallback(debugIdModule)
     const modifiedPremodules = prependModule(premodules, debugIdModule)
 
-    // Run wrapped serializer
-    const serializerResult = serializer(entryPoint, modifiedPremodules, graph, options)
-    const { code: bundleCode, map: bundleMapString } = await extractSerializerResult(serializerResult)
+    // Run wrapped serializer. The default serializer invokes posthogBundleCallback
+    // after Metro assembles the bundle and before it renders code/source maps, so
+    // the same real ID is present in both outputs.
+    const serializerResult = serializer(entryPoint, modifiedPremodules, graph, serializerOptions)
+    const extracted = await extractSerializerResult(serializerResult)
+    let bundleCode = extracted.code
 
-    // Add Chunk ID comment to the bundle
-    const debugId = determineDebugIdFromBundleSource(bundleCode)
+    // Custom serializers may not know about posthogBundleCallback. Keep those
+    // working by deriving the ID from their final bundle and replacing the
+    // placeholder in the emitted code instead of failing the build.
+    let debugId = determineDebugIdFromBundleSource(bundleCode)
     if (!debugId) {
-      throw new Error('Chunk ID was not found in the bundle.')
+      debugId = calculateDebugId(bundleCode)
+      bundleCode = injectDebugId(bundleCode, debugId)
     }
+
     // Only print Chunk ID for command line builds => not hot reload from dev server
     // eslint-disable-next-line no-console
     console.log('info ' + `Bundle Chunk ID: ${debugId}`)
@@ -95,14 +114,29 @@ export const createPostHogMetroSerializer = (customSerializer?: MetroSerializer)
             indexOfSourceMapComment
           )}`
 
-    const bundleMap: SourceMap = JSON.parse(bundleMapString)
-
+    const bundleMap: SourceMap = JSON.parse(extracted.map)
     bundleMap['chunkId'] = debugId
 
     return {
       code: bundleCodeWithDebugId,
       map: JSON.stringify(bundleMap),
     }
+  }
+}
+
+/**
+ * Called by the default Metro serializer after baseJSBundle has produced the
+ * final bundle but before source-map generation. That ordering is important:
+ * both generated code and sourcesContent must contain the same real Chunk ID.
+ */
+function createPostHogBundleCallback(
+  debugIdModule: Module<VirtualJSOutput> & { setSource: (code: string) => void }
+): (bundle: Bundle) => Bundle {
+  return (bundle) => {
+    const debugId = calculateDebugId(bundle.pre, bundle.modules)
+    debugIdModule.setSource(injectDebugId(debugIdModule.getSource().toString(), debugId))
+    bundle.pre = injectDebugId(bundle.pre, debugId)
+    return bundle
   }
 }
 
@@ -125,4 +159,19 @@ async function extractSerializerResult(serializerResult: MetroSerializerOutput):
 
 function createDebugIdModule(debugId: string): Module<VirtualJSOutput> & { setSource: (code: string) => void } {
   return createVirtualJSModule(DEBUG_ID_MODULE_PATH, createDebugIdSnippet(debugId))
+}
+
+function calculateDebugId(bundleCode: string, modules?: Array<[id: number, code: string]>): string {
+  const hash = crypto.createHash('md5')
+  hash.update(bundleCode)
+  if (modules) {
+    for (const [, code] of modules) {
+      hash.update(code)
+    }
+  }
+  return stringToUUID(hash.digest('hex'))
+}
+
+function injectDebugId(code: string, debugId: string): string {
+  return code.replace(new RegExp(DEBUG_ID_PLACE_HOLDER, 'g'), debugId)
 }
