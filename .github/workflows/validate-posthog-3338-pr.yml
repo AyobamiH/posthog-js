@@ -1,0 +1,131 @@
+name: Validate PostHog #3338 PR
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  react-native:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout validation branch
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint React Native package
+        run: pnpm --filter=posthog-react-native lint
+
+      - name: Build React Native dependency graph
+        run: pnpm --filter=posthog-react-native... build
+
+      - name: Test React Native package
+        run: pnpm --filter=posthog-react-native test
+
+      - name: Pack local React Native SDK
+        run: |
+          pnpm --filter=posthog-react-native pack --pack-destination "$RUNNER_TEMP"
+          SDK_TARBALL="$(find "$RUNNER_TEMP" -maxdepth 1 -name 'posthog-react-native-*.tgz' -print -quit)"
+          test -n "$SDK_TARBALL"
+          echo "SDK_TARBALL=$SDK_TARBALL" >> "$GITHUB_ENV"
+
+      - name: Bundle bare React Native 0.81 app with Hermes
+        env:
+          BARE_RN_DIR: ${{ runner.temp }}/posthog-bare-rn
+          BUNDLE_FILE: ${{ runner.temp }}/posthog-bare-rn.js
+          SOURCEMAP_FILE: ${{ runner.temp }}/posthog-bare-rn.js.map
+        run: |
+          mkdir -p "$BARE_RN_DIR"
+
+          cat > "$BARE_RN_DIR/package.json" <<EOF
+          {
+            "name": "posthog-bare-rn-hermes-validation",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "posthog-react-native": "file:$SDK_TARBALL",
+              "react": "19.1.4",
+              "react-native": "0.81.6"
+            },
+            "devDependencies": {
+              "@react-native-community/cli": "20.0.0",
+              "@react-native-community/cli-platform-ios": "20.0.0",
+              "@react-native/metro-config": "0.81.6"
+            }
+          }
+          EOF
+
+          cat > "$BARE_RN_DIR/index.js" <<'EOF'
+          const React = require('react')
+          const { AppRegistry, View } = require('react-native')
+
+          function App() {
+            return React.createElement(View)
+          }
+
+          AppRegistry.registerComponent('PostHogBareHermesValidation', () => App)
+          EOF
+
+          cat > "$BARE_RN_DIR/metro.config.js" <<'EOF'
+          const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config')
+          const { createPostHogMetroSerializer } = require('posthog-react-native/metro')
+
+          module.exports = mergeConfig(getDefaultConfig(__dirname), {
+            serializer: {
+              customSerializer: createPostHogMetroSerializer(),
+            },
+          })
+          EOF
+
+          cd "$BARE_RN_DIR"
+          pnpm install
+          pnpm exec react-native bundle \
+            --platform ios \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output "$BUNDLE_FILE" \
+            --sourcemap-output "$SOURCEMAP_FILE"
+
+          node <<'NODE'
+          const fs = require('fs')
+
+          const bundle = fs.readFileSync(process.env.BUNDLE_FILE, 'utf8')
+          const sourcemapText = fs.readFileSync(process.env.SOURCEMAP_FILE, 'utf8')
+          const sourcemap = JSON.parse(sourcemapText)
+          const match = bundle.match(/\/\/# chunkId=([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/)
+
+          if (!match) {
+            throw new Error('Bare React Native bundle does not contain a real PostHog Chunk ID')
+          }
+
+          const chunkId = match[1]
+          if (sourcemap.chunkId !== chunkId) {
+            throw new Error(`Source map Chunk ID ${sourcemap.chunkId} does not match bundle Chunk ID ${chunkId}`)
+          }
+
+          if (bundle.includes('__POSTHOG_CHUNK_ID__') || sourcemapText.includes('__POSTHOG_CHUNK_ID__')) {
+            throw new Error('PostHog Chunk ID placeholder remains in bare React Native output')
+          }
+
+          if (!Array.isArray(sourcemap.sourcesContent) || !sourcemap.sourcesContent.some((source) => source?.includes(chunkId))) {
+            throw new Error('Generated Chunk ID is missing from source-map sourcesContent')
+          }
+
+          console.log(`Bare React Native Hermes bundle verified with Chunk ID ${chunkId}`)
+          NODE
