@@ -32,8 +32,8 @@ jobs:
       - name: Lint React Native package
         run: pnpm --filter=posthog-react-native lint
 
+      - name: Build React Native dependency graph
+        run: pnpm --filter=posthog-react-native... build
+
       - name: Test React Native package
         run: pnpm --filter=posthog-react-native test
-
-      - name: Build React Native package
-        run: pnpm --filter=posthog-react-native build
