@@ -19,8 +19,10 @@ env:
   CI: true
   HUSKY: 0
   TURBO_TELEMETRY_DISABLED: 1
-  SOURCE_SHA: 90cbef84095826363b356d5687d1ab30a70d80df
+  SOURCE_SHA: df820ebb9cad671ba444bbde4d88661bf7f290c0
   REVIEWED_SHA: f1c3a289dfe75f546193c5e3985971551e9cbc5d
+  EXPECTED_TREE: eecff7a3d53ea83e8a7788b86f89ee05679fac2a
+  EXPECTED_PARENT: 6e9f93123007a549142dac183f55ab648140005f
 
 jobs:
   verify:
@@ -41,10 +43,35 @@ jobs:
         with:
           node-version: 24.x
           cache: pnpm
-      - name: Record source
+      - name: Verify source identity and GitHub signature
+        id: signature
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p evidence
           { git rev-parse HEAD; git rev-parse HEAD^{tree}; node --version; pnpm --version; } | tee evidence/source.txt
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          node --input-type=module <<'JS'
+          import fs from 'node:fs'
+          const response = await fetch(`https://api.github.com/repos/AyobamiH/posthog-js/git/commits/${process.env.SOURCE_SHA}`, {
+            headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json' }
+          })
+          if (!response.ok) throw new Error(`Commit verification HTTP ${response.status}`)
+          const commit = await response.json()
+          if (commit.sha !== process.env.SOURCE_SHA || commit.tree.sha !== process.env.EXPECTED_TREE ||
+              commit.parents.length !== 1 || commit.parents[0].sha !== process.env.EXPECTED_PARENT ||
+              commit.author.email !== '47716486+AyobamiH@users.noreply.github.com' ||
+              commit.verification.verified !== true || commit.verification.reason !== 'valid') {
+            throw new Error('Signed commit does not match the expected identity, tree, parent, or verification state')
+          }
+          const proof = { sha: commit.sha, tree: commit.tree.sha, parent: commit.parents[0].sha, author: commit.author,
+            committer: commit.committer, verified: commit.verification.verified, reason: commit.verification.reason,
+            verifiedAt: commit.verification.verified_at }
+          fs.writeFileSync('evidence/signature.json', JSON.stringify(proof, null, 2))
+          console.log('SIGNED SOURCE PROOF:', JSON.stringify(proof))
+          JS
           git fetch --depth=1 origin "$REVIEWED_SHA"
       - name: Install frozen workspace
         id: install
@@ -61,8 +88,8 @@ jobs:
           trap 'cp "$RUNNER_TEMP/Surveys.candidate.tsx" "$source_file"' EXIT
           git show "$REVIEWED_SHA:$source_file" > "$source_file"
           set +e
-          pnpm --filter posthog-react-native exec vitest run test/survey-response-attribution.spec.tsx --coverage.enabled=false --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/review-red.json" 2>&1 | tee evidence/review-red.log
-          code=${PIPESTATUS[0]}
+          pnpm --filter posthog-react-native exec vitest run test/survey-response-attribution.spec.tsx --coverage.enabled=false --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/review-red.json" > evidence/review-red.log 2>&1
+          code=$?
           set -e
           test "$code" -eq 1
           node <<'JS'
@@ -82,8 +109,14 @@ jobs:
           if (r.numTotalTests !== 8 || r.numFailedTests !== 7 || r.numPassedTests !== 1 || JSON.stringify(titles) !== JSON.stringify(expected)) {
             throw new Error(`Unexpected red result: ${JSON.stringify({total:r.numTotalTests, passed:r.numPassedTests, failed:r.numFailedTests, titles})}`)
           }
-          if (!failed.every(t => t.failureMessages.join('\n').includes('$survey_response'))) throw new Error('Failure was not the expected response-payload assertion')
-          console.log('REVIEW RED PROOF: 7 expected missing-response assertions fail; 1 unanswered-dismissal control passes.')
+          // Vitest 1's JSON reporter omits assertion diffs from failureMessages.
+          // Check the actual payload-assertion headings, not diff-only property names.
+          if (!failed.every(t => /expected[\s\S]*(to be called with arguments|to match object)/.test(t.failureMessages.join('\n')))) {
+            throw new Error('Unexpected non-payload assertion failure')
+          }
+          const proof = { reviewedSource: process.env.REVIEWED_SHA, tests: 8, expectedFailures: 7, passingControls: 1, titles }
+          fs.writeFileSync('evidence/red-summary.json', JSON.stringify(proof, null, 2))
+          console.log('REVIEW RED PROOF:', JSON.stringify(proof))
           JS
       - name: Full React Native suite on corrected source
         id: tests
@@ -95,8 +128,8 @@ jobs:
           node <<'JS'
           const fs = require('fs')
           const r = JSON.parse(fs.readFileSync('evidence/review-green.json', 'utf8'))
-          const summary = { source: process.env.SOURCE_SHA, tests: r.numTotalTests, passed: r.numPassedTests, failed: r.numFailedTests, pending: r.numPendingTests }
-          if (r.numTotalTests !== 717 || r.numPassedTests !== 717 || r.numFailedTests !== 0) throw new Error(JSON.stringify(summary))
+          const summary = { source: process.env.SOURCE_SHA, testFiles: r.testResults.length, tests: r.numTotalTests, passed: r.numPassedTests, failed: r.numFailedTests, pending: r.numPendingTests }
+          if (r.numTotalTests !== 717 || r.numPassedTests !== 717 || r.numFailedTests !== 0 || r.numPendingTests !== 0) throw new Error(JSON.stringify(summary))
           fs.writeFileSync('evidence/test-summary.json', JSON.stringify(summary, null, 2))
           console.log('REVIEW GREEN PROOF:', JSON.stringify(summary))
           JS
@@ -115,6 +148,7 @@ jobs:
       - name: Aggregate verification
         if: always()
         env:
+          SIGNATURE: ${{ steps.signature.outcome }}
           INSTALL: ${{ steps.install.outcome }}
           BUILD: ${{ steps.build.outcome }}
           RED: ${{ steps.red.outcome }}
@@ -122,8 +156,8 @@ jobs:
           LINT: ${{ steps.lint.outcome }}
           FORMAT: ${{ steps.format.outcome }}
         run: |
-          printf 'source=%s\ninstall=%s\nbuild=%s\nred=%s\ntests=%s\nlint=%s\nformat=%s\n' "$SOURCE_SHA" "$INSTALL" "$BUILD" "$RED" "$TESTS" "$LINT" "$FORMAT" | tee evidence/outcome.txt >> "$GITHUB_STEP_SUMMARY"
-          test "$INSTALL" = success && test "$BUILD" = success && test "$RED" = success && test "$TESTS" = success && test "$LINT" = success && test "$FORMAT" = success
+          printf 'source=%s\nsignature=%s\ninstall=%s\nbuild=%s\nred=%s\ntests=%s\nlint=%s\nformat=%s\n' "$SOURCE_SHA" "$SIGNATURE" "$INSTALL" "$BUILD" "$RED" "$TESTS" "$LINT" "$FORMAT" | tee evidence/outcome.txt >> "$GITHUB_STEP_SUMMARY"
+          test "$SIGNATURE" = success && test "$INSTALL" = success && test "$BUILD" = success && test "$RED" = success && test "$TESTS" = success && test "$LINT" = success && test "$FORMAT" = success
       - name: Retain verification evidence
         if: always()
         uses: actions/upload-artifact@v4
