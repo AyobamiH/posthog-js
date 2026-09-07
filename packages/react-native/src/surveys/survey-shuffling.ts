@@ -1,9 +1,16 @@
 import { MultipleSurveyQuestion, Survey, SurveyQuestion } from '@posthog/core'
 
+type SurveyWithPartialResponses = Survey & {
+  enable_partial_responses?: boolean | null
+}
+
 const hasBranching = (survey: Survey): boolean => survey.questions.some((question) => !!question.branching?.type)
 
-export const shouldShuffleQuestions = (survey: Survey): boolean =>
-  !!survey.appearance?.shuffleQuestions && !survey.enable_partial_responses && !hasBranching(survey)
+export const shouldShuffleQuestions = (survey: Survey): boolean => {
+  const partialResponsesEnabled = (survey as SurveyWithPartialResponses).enable_partial_responses
+
+  return !!survey.appearance?.shuffleQuestions && !partialResponsesEnabled && !hasBranching(survey)
+}
 
 /**
  * Fisher-Yates shuffle without mutating the input array.
