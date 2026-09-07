@@ -50,5 +50,5 @@ jobs:
             packages/react-native/src/surveys/components/QuestionTypes.tsx \
             packages/react-native/test/survey-shuffling.spec.ts \
             packages/react-native/test/Questions.shuffling.spec.tsx
-      - name: React Native build
-        run: pnpm --filter posthog-react-native build
+      - name: React Native build with dependencies
+        run: pnpm turbo build --filter=posthog-react-native...
