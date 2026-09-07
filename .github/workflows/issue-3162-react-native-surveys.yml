@@ -14,7 +14,7 @@ concurrency:
 env:
   CI: true
   HUSKY: 0
-  SOURCE_SHA: f15cf032994049e7f10ec10b5c0f21e792041b06
+  SOURCE_SHA: f1c3a289dfe75f546193c5e3985971551e9cbc5d
 
 jobs:
   verify:
