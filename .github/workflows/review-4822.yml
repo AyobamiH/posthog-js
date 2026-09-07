@@ -1,0 +1,133 @@
+name: PR 4822 review verification
+
+on:
+  push:
+    branches: [ci/4822-review]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: review-4822
+  cancel-in-progress: true
+
+env:
+  CI: true
+  HUSKY: 0
+  TURBO_TELEMETRY_DISABLED: 1
+  SOURCE_SHA: 90cbef84095826363b356d5687d1ab30a70d80df
+  REVIEWED_SHA: f1c3a289dfe75f546193c5e3985971551e9cbc5d
+
+jobs:
+  verify:
+    if: github.repository == 'AyobamiH/posthog-js'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - name: Record source
+        run: |
+          mkdir -p evidence
+          { git rev-parse HEAD; git rev-parse HEAD^{tree}; node --version; pnpm --version; } | tee evidence/source.txt
+          git fetch --depth=1 origin "$REVIEWED_SHA"
+      - name: Install frozen workspace
+        id: install
+        run: pnpm install --frozen-lockfile 2>&1 | tee evidence/install.log
+      - name: Build React Native and dependencies
+        id: build
+        run: pnpm turbo build --filter=posthog-react-native... 2>&1 | tee evidence/build.log
+      - name: Prove the review regression on the old source
+        id: red
+        continue-on-error: true
+        run: |
+          source_file=packages/react-native/src/surveys/components/Surveys.tsx
+          cp "$source_file" "$RUNNER_TEMP/Surveys.candidate.tsx"
+          trap 'cp "$RUNNER_TEMP/Surveys.candidate.tsx" "$source_file"' EXIT
+          git show "$REVIEWED_SHA:$source_file" > "$source_file"
+          set +e
+          pnpm --filter posthog-react-native exec vitest run test/survey-response-attribution.spec.tsx --coverage.enabled=false --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/review-red.json" 2>&1 | tee evidence/review-red.log
+          code=${PIPESTATUS[0]}
+          set -e
+          test "$code" -eq 1
+          node <<'JS'
+          const fs = require('fs')
+          const r = JSON.parse(fs.readFileSync('evidence/review-red.json', 'utf8'))
+          const failed = r.testResults.flatMap(s => s.assertionResults).filter(t => t.status === 'failed')
+          const expected = [
+            'preserves configured indices on submission (shuffle=true)',
+            'preserves configured indices on submission (shuffle=false)',
+            'preserves configured indices on dismissal (shuffle=true)',
+            'preserves configured indices on dismissal (shuffle=false)',
+            'does not renumber answers when branching skips a question',
+            'serializes sent responses without a prior render',
+            'serializes dismissed responses without a prior render',
+          ].sort()
+          const titles = failed.map(t => t.title).sort()
+          if (r.numTotalTests !== 8 || r.numFailedTests !== 7 || r.numPassedTests !== 1 || JSON.stringify(titles) !== JSON.stringify(expected)) {
+            throw new Error(`Unexpected red result: ${JSON.stringify({total:r.numTotalTests, passed:r.numPassedTests, failed:r.numFailedTests, titles})}`)
+          }
+          if (!failed.every(t => t.failureMessages.join('\n').includes('$survey_response'))) throw new Error('Failure was not the expected response-payload assertion')
+          console.log('REVIEW RED PROOF: 7 expected missing-response assertions fail; 1 unanswered-dismissal control passes.')
+          JS
+      - name: Full React Native suite on corrected source
+        id: tests
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          git diff --exit-code -- packages/react-native/src/surveys/components/Surveys.tsx
+          pnpm --filter posthog-react-native test:unit --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/review-green.json" 2>&1 | tee evidence/tests.log
+          node <<'JS'
+          const fs = require('fs')
+          const r = JSON.parse(fs.readFileSync('evidence/review-green.json', 'utf8'))
+          const summary = { source: process.env.SOURCE_SHA, tests: r.numTotalTests, passed: r.numPassedTests, failed: r.numFailedTests, pending: r.numPendingTests }
+          if (r.numTotalTests !== 717 || r.numPassedTests !== 717 || r.numFailedTests !== 0) throw new Error(JSON.stringify(summary))
+          fs.writeFileSync('evidence/test-summary.json', JSON.stringify(summary, null, 2))
+          console.log('REVIEW GREEN PROOF:', JSON.stringify(summary))
+          JS
+      - name: React Native lint
+        id: lint
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: pnpm --filter posthog-react-native lint 2>&1 | tee evidence/lint.log
+      - name: Formatting and minor changeset
+        id: format
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          pnpm exec oxfmt --check packages/react-native/src/surveys/components/Surveys.tsx packages/react-native/test/survey-response-attribution.spec.tsx 2>&1 | tee evidence/format.log
+          grep -Fx "'posthog-react-native': minor" .changeset/rn-survey-shuffling.md
+      - name: Aggregate verification
+        if: always()
+        env:
+          INSTALL: ${{ steps.install.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          RED: ${{ steps.red.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+          LINT: ${{ steps.lint.outcome }}
+          FORMAT: ${{ steps.format.outcome }}
+        run: |
+          printf 'source=%s\ninstall=%s\nbuild=%s\nred=%s\ntests=%s\nlint=%s\nformat=%s\n' "$SOURCE_SHA" "$INSTALL" "$BUILD" "$RED" "$TESTS" "$LINT" "$FORMAT" | tee evidence/outcome.txt >> "$GITHUB_STEP_SUMMARY"
+          test "$INSTALL" = success && test "$BUILD" = success && test "$RED" = success && test "$TESTS" = success && test "$LINT" = success && test "$FORMAT" = success
+      - name: Retain verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-4822-review-evidence
+          path: evidence/
+          retention-days: 30
