@@ -1,0 +1,54 @@
+name: Issue 3162 React Native survey shuffling
+
+on:
+  push:
+    branches: [ci/3162-react-native-survey-shuffling]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-3162-react-native-surveys
+  cancel-in-progress: true
+
+env:
+  CI: true
+  HUSKY: 0
+  SOURCE_SHA: 38c01ee1715ac3ae76a7de396e663795d4f8e3b2
+
+jobs:
+  verify:
+    if: github.repository == 'AyobamiH/posthog-js'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - name: Install workspace
+        run: pnpm install --frozen-lockfile
+      - name: React Native unit suite
+        run: pnpm --filter posthog-react-native test:unit
+      - name: React Native lint
+        run: pnpm --filter posthog-react-native lint
+      - name: Format changed files
+        run: |
+          pnpm exec oxfmt --check \
+            packages/react-native/src/surveys/survey-shuffling.ts \
+            packages/react-native/src/surveys/components/Surveys.tsx \
+            packages/react-native/src/surveys/components/QuestionTypes.tsx \
+            packages/react-native/test/survey-shuffling.spec.ts \
+            packages/react-native/test/Questions.shuffling.spec.tsx
+      - name: React Native build
+        run: pnpm --filter posthog-react-native build
