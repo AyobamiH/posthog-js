@@ -1,0 +1,47 @@
+name: PR 4794 review verification
+
+on:
+  push:
+    branches: [work/4794-review-verification]
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: review-4794
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    if: github.repository == 'AyobamiH/posthog-js'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check integration with the inspected upstream commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch https://github.com/PostHog/posthog-js.git 71ec4636e54203f50a464d20e03fd98bcd63e538
+          set +e
+          git merge --no-commit --no-ff 71ec4636e54203f50a464d20e03fd98bcd63e538
+          result=$?
+          set -e
+          if [ "$result" -ne 0 ]; then
+            git diff --name-only --diff-filter=U
+            git diff --cc
+            exit "$result"
+          fi
+          if [ -f .git/MERGE_HEAD ]; then
+            git commit -m 'Merge inspected upstream main for isolated PR 4794 verification'
+            git push origin HEAD:work/4794-review-verification
+          fi
+          git rev-parse HEAD
+          cat package.json
+          cat .github/workflows/library-ci.yml
