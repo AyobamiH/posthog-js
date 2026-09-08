@@ -54,10 +54,10 @@ jobs:
           cache: pnpm
       - name: Install frozen workspace
         id: install
-        run: pnpm install --frozen-lockfile 2>&1 | tee evidence/install.log
+        run: pnpm install --frozen-lockfile > evidence/install.log 2>&1
       - name: Build browser dependencies
         id: dependencies
-        run: pnpm turbo build --filter='posthog-js^...' --concurrency=2 2>&1 | tee evidence/dependencies.log
+        run: pnpm turbo build --filter='posthog-js^...' --concurrency=2 > evidence/dependencies.log 2>&1
       - name: Reproduce all six lifecycle assertions on reviewed source
         id: red
         continue-on-error: true
@@ -85,25 +85,18 @@ jobs:
           from pathlib import Path
           def replace(path, before, after):
               p=Path(path); text=p.read_text()
-              if text.count(before)!=1: raise RuntimeError('Unexpected source for '+path)
+              if text.count(before)!=1: raise RuntimeError('Unexpected source for '+path+': '+repr(before))
               p.write_text(text.replace(before,after))
-          replace('packages/browser/src/posthog-surveys.ts', '''        // A refresh replaces the definitions, including an empty list. Do not keep hooks
-                  // pointing at events/actions that were removed from the latest definitions.
-                  this._surveyEventReceiver?.replace(eventOrActionBasedSurveys)'''.replace('\n        ', '\n'), '''        if (eventOrActionBasedSurveys.length > 0) {
-                      this._surveyEventReceiver?.register(eventOrActionBasedSurveys)
-                  }'''.replace('\n        ', '\n'))
-          replace('packages/types/src/posthog.ts', '''     * Register a callback that is called with the initial active matching surveys and whenever
-               * event or action activation changes that set.'''.replace('\n        ', '\n'), '''     * Observe the initial matching surveys and updates after event/action and survey lifecycle
-               * changes, definitions refreshes, captured pageviews, feature-flag updates, and reset.
-               * URL changes require a captured pageview; arbitrary DOM mutations and elapsed time
-               * are not observed. Unchanged results are suppressed. Recoverable load errors are
-               * reported through the optional context without ending the subscription.'''.replace('\n        ', '\n'))
-          replace('packages/types/src/posthog.ts', '    onActiveMatchingSurveysChanged(callback: (surveys: any[]) => void): () => void', '''    onActiveMatchingSurveysChanged(
-                  callback: (surveys: any[], context?: { isLoaded: boolean; error?: string }) => void
-              ): () => void'''.replace('\n        ', '\n'))
+          before='\n'.join(['        // A refresh replaces the definitions, including an empty list. Do not keep hooks','        // pointing at events/actions that were removed from the latest definitions.','        this._surveyEventReceiver?.replace(eventOrActionBasedSurveys)'])
+          after='\n'.join(['        if (eventOrActionBasedSurveys.length > 0) {','            this._surveyEventReceiver?.register(eventOrActionBasedSurveys)','        }'])
+          replace('packages/browser/src/posthog-surveys.ts',before,after)
+          before='\n'.join(['     * Register a callback that is called with the initial active matching surveys and whenever','     * event or action activation changes that set.'])
+          after='\n'.join(['     * Observe the initial matching surveys and updates after event/action and survey lifecycle','     * changes, definitions refreshes, captured pageviews, feature-flag updates, and reset.','     * URL changes require a captured pageview; arbitrary DOM mutations and elapsed time','     * are not observed. Unchanged results are suppressed. Recoverable load errors are','     * reported through the optional context without ending the subscription.'])
+          replace('packages/types/src/posthog.ts',before,after)
+          after='\n'.join(['    onActiveMatchingSurveysChanged(','        callback: (surveys: any[], context?: { isLoaded: boolean; error?: string }) => void','    ): () => void'])
+          replace('packages/types/src/posthog.ts','    onActiveMatchingSurveysChanged(callback: (surveys: any[]) => void): () => void',after)
           p=Path('packages/browser/src/__tests__/active-matching-surveys.test.ts')
-          text=p.read_text()
-          text="import type { PostHog as PostHogInterface } from '@posthog/types'\n"+text
+          text="import type { PostHog as PostHogInterface } from '@posthog/types'\n"+p.read_text()
           i=text.rfind('\n})')
           if i<0: raise RuntimeError('Missing test suite terminator')
           text=text[:i]+'''
@@ -175,7 +168,7 @@ jobs:
           set -e
           test "$result" -ne 0
           python3 <<'PY'
-          import pathlib,re
+          import pathlib
           log=pathlib.Path('evidence/baseline-test-typecheck.log').read_text()
           errors=[line for line in log.splitlines() if 'error TS' in line]
           if len(errors)!=2 or not all('TS2688' in line for line in errors) or not all(name in '\n'.join(errors) for name in ["'dompurify'","'dotenv'"]):
@@ -196,7 +189,7 @@ jobs:
           pnpm check:public-api > evidence/public-api.log 2>&1
       - name: Regenerate mangled names and build production bundles
         id: build
-        if: steps.patch.outcome == 'success'
+        if: steps.patch.outcome == 'success' && steps.focused.outcome == 'success' && steps.unit.outcome == 'success' && steps.types.outcome == 'success' && steps.lint.outcome == 'success' && steps.baseline_types.outcome == 'success'
         continue-on-error: true
         run: pnpm --filter posthog-js write-mangled-property-names > evidence/build.log 2>&1
       - name: Regenerate API references
@@ -302,8 +295,7 @@ jobs:
               p=pathlib.Path('evidence/'+name+'.json')
               if p.exists():
                   r=json.loads(p.read_text()); assertions=[t for s in r['testResults'] for t in s['assertionResults']]
-                  summaries[name]=dict(collections.Counter(t['status'] for t in assertions))
-                  summaries[name]['total']=len(assertions)
+                  summaries[name]=dict(collections.Counter(t['status'] for t in assertions)); summaries[name]['total']=len(assertions)
                   print(name.upper()+' ASSERTIONS:',json.dumps(summaries[name]))
           p=pathlib.Path('evidence/playwright.json')
           if p.exists():
