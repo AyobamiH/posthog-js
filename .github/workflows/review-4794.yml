@@ -15,33 +15,193 @@ concurrency:
   group: review-4794
   cancel-in-progress: true
 
+env:
+  CI: true
+  HUSKY: 0
+  PREK: 0
+  TURBO_TELEMETRY_DISABLED: 1
+  NODE_OPTIONS: --max-old-space-size=6144
+  UPSTREAM_SHA: 71ec4636e54203f50a464d20e03fd98bcd63e538
+  REVIEWED_SHA: 26539d0055c9c5a17b3a0f87521ffe8b52dd7c6b
+
 jobs:
-  prepare:
+  verify:
     if: github.repository == 'AyobamiH/posthog-js'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Check integration with the inspected upstream commit
+          persist-credentials: false
+      - name: Integrate inspected upstream without changing a remote ref
+        id: source
         run: |
+          mkdir -p evidence
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git fetch https://github.com/PostHog/posthog-js.git 71ec4636e54203f50a464d20e03fd98bcd63e538
+          git fetch https://github.com/PostHog/posthog-js.git "$UPSTREAM_SHA"
+          git merge --no-commit --no-ff "$UPSTREAM_SHA"
+          git commit -m 'Prepare upstream-integrated verification workspace'
+          { git rev-parse HEAD; git rev-parse HEAD^{tree}; } | tee evidence/source.txt
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - name: Install frozen workspace
+        id: install
+        run: pnpm install --frozen-lockfile 2>&1 | tee evidence/install.log
+      - name: Build browser dependencies
+        id: dependencies
+        run: pnpm turbo build --filter='posthog-js^...' --concurrency=2 2>&1 | tee evidence/dependencies.log
+      - name: Reproduce all six lifecycle assertions on reviewed source
+        id: red
+        continue-on-error: true
+        run: |
           set +e
-          git merge --no-commit --no-ff 71ec4636e54203f50a464d20e03fd98bcd63e538
+          pnpm --filter posthog-js exec vitest run src/__tests__/active-matching-surveys.test.ts --testNamePattern='review regression:' --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/red.json" > evidence/red.log 2>&1
           result=$?
           set -e
-          if [ "$result" -ne 0 ]; then
-            git diff --name-only --diff-filter=U
-            git diff --cc
-            exit "$result"
-          fi
-          if [ -f .git/MERGE_HEAD ]; then
-            git commit -m 'Merge inspected upstream main for isolated PR 4794 verification'
-            git push origin HEAD:work/4794-review-verification
-          fi
-          git rev-parse HEAD
-          cat package.json
-          cat .github/workflows/library-ci.yml
+          cat evidence/red.log
+          test "$result" -eq 1
+          node <<'JS'
+          const fs = require('fs')
+          const report = JSON.parse(fs.readFileSync('evidence/red.json', 'utf8'))
+          const assertions = report.testResults.flatMap(s => s.assertionResults)
+          const failures = assertions.filter(t => t.status === 'failed')
+          const summary = { total: report.numTotalTests, failed: report.numFailedTests, passed: report.numPassedTests, failures: failures.map(t => ({title: t.title, messages: t.failureMessages})) }
+          fs.writeFileSync('evidence/red-summary.json', JSON.stringify(summary, null, 2))
+          console.log('RED PROOF:', JSON.stringify(summary))
+          if (failures.length !== 6 || !failures.every(t => t.title.startsWith('review regression:') && /expected|toEqual|toBe|toHaveBeen/.test(t.failureMessages.join('\n')))) throw new Error('Expected six reproduced review assertion failures, not a setup failure')
+          JS
+      - name: Apply review fixes and format changed source
+        id: patch
+        run: |
+          python3 .github/scripts/review-4794.py
+          pnpm exec oxfmt --write packages/browser/src/posthog-surveys.ts packages/browser/src/browser-surveys.ts packages/browser/src/surveys-config.ts packages/browser/src/utils/event-receiver.ts packages/browser/src/posthog-core.ts packages/browser/src/__tests__/active-matching-surveys.test.ts packages/browser/src/__tests__/posthog-surveys.test.ts
+          git diff --check
+          git diff --stat "$UPSTREAM_SHA" | tee evidence/diff-stat.txt
+      - name: Run focused subscription regressions
+        id: focused
+        continue-on-error: true
+        run: pnpm --filter posthog-js exec vitest run src/__tests__/active-matching-surveys.test.ts src/__tests__/posthog-surveys.test.ts --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/focused.json" 2>&1 | tee evidence/focused.log
+      - name: Full browser unit suite
+        id: unit
+        if: steps.patch.outcome == 'success'
+        continue-on-error: true
+        run: pnpm --filter posthog-js test:unit --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/unit.json" 2>&1 | tee evidence/unit.log
+      - name: Browser functional suite
+        id: functional
+        if: steps.patch.outcome == 'success'
+        continue-on-error: true
+        run: pnpm --filter posthog-js test:functional 2>&1 | tee evidence/functional.log
+      - name: Browser production and test type checking
+        id: types
+        if: steps.patch.outcome == 'success'
+        continue-on-error: true
+        run: |
+          pnpm --filter posthog-js typecheck 2>&1 | tee evidence/typecheck.log
+          pnpm --filter posthog-js test:typecheck 2>&1 | tee evidence/test-typecheck.log
+      - name: Browser and shared types lint and tests
+        id: lint
+        if: steps.patch.outcome == 'success'
+        continue-on-error: true
+        run: |
+          pnpm --filter posthog-js lint 2>&1 | tee evidence/browser-lint.log
+          pnpm --filter @posthog/types test:unit 2>&1 | tee evidence/shared-types-test.log
+          pnpm --filter @posthog/types lint 2>&1 | tee evidence/shared-types-lint.log
+          pnpm format 2>&1 | tee evidence/format.log
+          pnpm lint:oxlint 2>&1 | tee evidence/oxlint.log
+          pnpm check:public-api 2>&1 | tee evidence/public-api.log
+      - name: Regenerate mangled names and build production bundles
+        id: build
+        if: steps.patch.outcome == 'success'
+        continue-on-error: true
+        run: pnpm --filter posthog-js write-mangled-property-names 2>&1 | tee evidence/build.log
+      - name: Regenerate API references
+        id: references
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: pnpm --filter posthog-js generate-references 2>&1 | tee evidence/references.log
+      - name: Verify generated-file stability and ordinary production build
+        id: deterministic
+        if: steps.references.outcome == 'success'
+        continue-on-error: true
+        run: |
+          sha256sum packages/browser/terser-mangled-names.json packages/browser/references/posthog-js-references-latest.json > evidence/generated-before.sha256
+          pnpm --filter posthog-js write-mangled-property-names > evidence/build-second.log 2>&1
+          pnpm --filter posthog-js generate-references > evidence/references-second.log 2>&1
+          sha256sum -c evidence/generated-before.sha256
+          pnpm --filter posthog-js build > evidence/build-ordinary.log 2>&1
+          git diff --check
+      - name: Retain final candidate as Git objects, without updating a branch
+        id: candidate
+        if: steps.patch.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 <<'PY'
+          import base64, json, os, pathlib, subprocess, urllib.request
+          api = 'https://api.github.com/repos/AyobamiH/posthog-js'
+          def request(path, payload=None):
+              req = urllib.request.Request(api + path, data=None if payload is None else json.dumps(payload).encode(), headers={'Authorization': 'Bearer '+os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req) as r: return json.load(r)
+          upstream = os.environ['UPSTREAM_SHA']
+          base_tree = request('/git/commits/' + upstream)['tree']['sha']
+          changed = subprocess.check_output(['git', 'diff', '--name-only', upstream], text=True).splitlines()
+          entries = []
+          for path in changed:
+              if path in ['.github/workflows/review-4794.yml', '.github/scripts/review-4794.py']: continue
+              if not (path.startswith('packages/browser/') or path.startswith('packages/types/') or path == '.changeset/fresh-surveys-listen.md'):
+                  raise RuntimeError('Unexpected candidate change: ' + path)
+              p = pathlib.Path(path)
+              sha = request('/git/blobs', {'content': base64.b64encode(p.read_bytes()).decode(), 'encoding': 'base64'})['sha'] if p.exists() else None
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+          tree = request('/git/trees', {'base_tree': base_tree, 'tree': entries})['sha']
+          manifest = {'tree': tree, 'reviewed': os.environ['REVIEWED_SHA'], 'upstream': upstream, 'entries': entries}
+          pathlib.Path('evidence/candidate.json').write_text(json.dumps(manifest, indent=2))
+          print('CANDIDATE MANIFEST:', json.dumps(manifest))
+          PY
+      - name: Aggregate verification
+        if: always()
+        env:
+          SOURCE: ${{ steps.source.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          DEPENDENCIES: ${{ steps.dependencies.outcome }}
+          RED: ${{ steps.red.outcome }}
+          PATCH: ${{ steps.patch.outcome }}
+          FOCUSED: ${{ steps.focused.outcome }}
+          UNIT: ${{ steps.unit.outcome }}
+          FUNCTIONAL: ${{ steps.functional.outcome }}
+          TYPES: ${{ steps.types.outcome }}
+          LINT: ${{ steps.lint.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          REFERENCES: ${{ steps.references.outcome }}
+          DETERMINISTIC: ${{ steps.deterministic.outcome }}
+          CANDIDATE: ${{ steps.candidate.outcome }}
+        run: |
+          python3 <<'PY'
+          import os, json, pathlib
+          keys = 'SOURCE INSTALL DEPENDENCIES RED PATCH FOCUSED UNIT FUNCTIONAL TYPES LINT BUILD REFERENCES DETERMINISTIC CANDIDATE'.split()
+          result = {key: os.environ[key] for key in keys}
+          print('VERIFICATION OUTCOME:', json.dumps(result))
+          pathlib.Path('evidence').mkdir(exist_ok=True)
+          pathlib.Path('evidence/outcome.json').write_text(json.dumps(result, indent=2))
+          for name in ['focused', 'unit']:
+              p=pathlib.Path('evidence/'+name+'.json')
+              if p.exists():
+                  r=json.loads(p.read_text())
+                  print(name.upper()+' SUMMARY:', json.dumps({k:r.get(k) for k in ['numTotalTests','numPassedTests','numFailedTests','numPendingTests']}))
+          if not all(value == 'success' for value in result.values()): raise SystemExit(1)
+          PY
+      - name: Retain verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-4794-review-evidence
+          path: evidence/
+          retention-days: 30
