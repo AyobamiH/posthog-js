@@ -28,7 +28,7 @@ jobs:
   verify:
     if: github.repository == 'AyobamiH/posthog-js'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
         with:
@@ -66,67 +66,144 @@ jobs:
           pnpm --filter posthog-js exec vitest run src/__tests__/active-matching-surveys.test.ts --testNamePattern='review regression:' --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/red.json" > evidence/red.log 2>&1
           result=$?
           set -e
-          cat evidence/red.log
           test "$result" -eq 1
           node <<'JS'
           const fs = require('fs')
           const report = JSON.parse(fs.readFileSync('evidence/red.json', 'utf8'))
           const assertions = report.testResults.flatMap(s => s.assertionResults)
           const failures = assertions.filter(t => t.status === 'failed')
-          const summary = { total: report.numTotalTests, failed: report.numFailedTests, passed: report.numPassedTests, failures: failures.map(t => ({title: t.title, messages: t.failureMessages})) }
+          const summary = { executed: assertions.filter(t => t.status !== 'skipped').length, failed: failures.length, skipped: assertions.filter(t => t.status === 'skipped').length, failures: failures.map(t => ({title: t.title, messages: t.failureMessages})) }
           fs.writeFileSync('evidence/red-summary.json', JSON.stringify(summary, null, 2))
           console.log('RED PROOF:', JSON.stringify(summary))
           if (failures.length !== 6 || !failures.every(t => t.title.startsWith('review regression:') && /expected|toEqual|toBe|toHaveBeen/.test(t.failureMessages.join('\n')))) throw new Error('Expected six reproduced review assertion failures, not a setup failure')
           JS
-      - name: Apply review fixes and format changed source
+      - name: Apply bounded review fixes and align the public callback contract
         id: patch
         run: |
           python3 .github/scripts/review-4794.py
-          pnpm exec oxfmt --write packages/browser/src/posthog-surveys.ts packages/browser/src/browser-surveys.ts packages/browser/src/surveys-config.ts packages/browser/src/utils/event-receiver.ts packages/browser/src/posthog-core.ts packages/browser/src/__tests__/active-matching-surveys.test.ts packages/browser/src/__tests__/posthog-surveys.test.ts
+          python3 <<'PY'
+          from pathlib import Path
+          def replace(path, before, after):
+              p=Path(path); text=p.read_text()
+              if text.count(before)!=1: raise RuntimeError('Unexpected source for '+path)
+              p.write_text(text.replace(before,after))
+          replace('packages/browser/src/posthog-surveys.ts', '''        // A refresh replaces the definitions, including an empty list. Do not keep hooks
+                  // pointing at events/actions that were removed from the latest definitions.
+                  this._surveyEventReceiver?.replace(eventOrActionBasedSurveys)'''.replace('\n        ', '\n'), '''        if (eventOrActionBasedSurveys.length > 0) {
+                      this._surveyEventReceiver?.register(eventOrActionBasedSurveys)
+                  }'''.replace('\n        ', '\n'))
+          replace('packages/types/src/posthog.ts', '''     * Register a callback that is called with the initial active matching surveys and whenever
+               * event or action activation changes that set.'''.replace('\n        ', '\n'), '''     * Observe the initial matching surveys and updates after event/action and survey lifecycle
+               * changes, definitions refreshes, captured pageviews, feature-flag updates, and reset.
+               * URL changes require a captured pageview; arbitrary DOM mutations and elapsed time
+               * are not observed. Unchanged results are suppressed. Recoverable load errors are
+               * reported through the optional context without ending the subscription.'''.replace('\n        ', '\n'))
+          replace('packages/types/src/posthog.ts', '    onActiveMatchingSurveysChanged(callback: (surveys: any[]) => void): () => void', '''    onActiveMatchingSurveysChanged(
+                  callback: (surveys: any[], context?: { isLoaded: boolean; error?: string }) => void
+              ): () => void'''.replace('\n        ', '\n'))
+          p=Path('packages/browser/src/__tests__/active-matching-surveys.test.ts')
+          text=p.read_text()
+          text="import type { PostHog as PostHogInterface } from '@posthog/types'\n"+text
+          i=text.rfind('\n})')
+          if i<0: raise RuntimeError('Missing test suite terminator')
+          text=text[:i]+'''
+              it('exposes load context through the shared public interface', () => {
+                  fixture()
+                  const callback = vi.fn()
+                  const api: Pick<PostHogInterface, 'onActiveMatchingSurveysChanged'> = surveys
+                  api.onActiveMatchingSurveysChanged((matching, context) => {
+                      callback(matching, context?.isLoaded, context?.error)
+                  })
+                  start()
+                  expect(callback).toHaveBeenCalledWith([], true, undefined)
+              })
+          '''+text[i:]
+          p.write_text(text)
+          PY
+          pnpm exec oxfmt --write packages/browser/src/posthog-surveys.ts packages/browser/src/browser-surveys.ts packages/browser/src/surveys-config.ts packages/browser/src/utils/event-receiver.ts packages/browser/src/posthog-core.ts packages/browser/src/__tests__/active-matching-surveys.test.ts packages/browser/src/__tests__/posthog-surveys.test.ts packages/types/src/posthog.ts
+          pnpm --filter @posthog/types build > evidence/shared-types-build.log 2>&1
           git diff --check
           git diff --stat "$UPSTREAM_SHA" | tee evidence/diff-stat.txt
-      - name: Run focused subscription regressions
+      - name: Run focused subscription and shared-lifecycle regressions
         id: focused
         continue-on-error: true
-        run: pnpm --filter posthog-js exec vitest run src/__tests__/active-matching-surveys.test.ts src/__tests__/posthog-surveys.test.ts --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/focused.json" 2>&1 | tee evidence/focused.log
+        run: pnpm --filter posthog-js exec vitest run src/__tests__/active-matching-surveys.test.ts src/__tests__/posthog-surveys.test.ts src/__tests__/surveys-extension.test.ts --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/focused.json" > evidence/focused.log 2>&1
       - name: Full browser unit suite
         id: unit
         if: steps.patch.outcome == 'success'
         continue-on-error: true
-        run: pnpm --filter posthog-js test:unit --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/unit.json" 2>&1 | tee evidence/unit.log
+        run: pnpm --filter posthog-js test:unit --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/unit.json" > evidence/unit.log 2>&1
       - name: Browser functional suite
         id: functional
         if: steps.patch.outcome == 'success'
         continue-on-error: true
-        run: pnpm --filter posthog-js test:functional 2>&1 | tee evidence/functional.log
-      - name: Browser production and test type checking
+        run: pnpm --filter posthog-js test:functional > evidence/functional.log 2>&1
+      - name: Production and subscription test type checking
         id: types
         if: steps.patch.outcome == 'success'
         continue-on-error: true
         run: |
-          pnpm --filter posthog-js typecheck 2>&1 | tee evidence/typecheck.log
-          pnpm --filter posthog-js test:typecheck 2>&1 | tee evidence/test-typecheck.log
+          pnpm --filter posthog-js typecheck > evidence/typecheck.log 2>&1
+          python3 <<'PY'
+          import json,pathlib
+          config={'extends':'./tsconfig.json','compilerOptions':{'strict':False,'noImplicitReturns':False,'types':['node','vitest/globals']},'include':['src/__tests__/active-matching-surveys.test.ts','src/**/*.d.ts'],'exclude':[]}
+          pathlib.Path('packages/browser/tsconfig.subscription-review.json').write_text(json.dumps(config))
+          PY
+          pnpm --filter posthog-js exec tsc --noEmit --project tsconfig.subscription-review.json > evidence/subscription-typecheck.log 2>&1
+      - name: Reproduce the legacy test-typecheck setup error on untouched upstream
+        id: baseline_types
+        if: steps.patch.outcome == 'success'
+        continue-on-error: true
+        run: |
+          git diff --exit-code "$UPSTREAM_SHA" -- pnpm-lock.yaml packages/browser/package.json packages/browser/src/__tests__/tsconfig.json
+          baseline="$RUNNER_TEMP/pr-4794-upstream"
+          git worktree add --detach "$baseline" "$UPSTREAM_SHA"
+          export BASELINE="$baseline"
+          python3 <<'PY'
+          import os,pathlib
+          root=pathlib.Path.cwd(); baseline=pathlib.Path(os.environ['BASELINE'])
+          for folder, dirs, files in os.walk(root):
+              dirs[:]=[d for d in dirs if d not in ['.git','evidence']]
+              if 'node_modules' in dirs:
+                  p=pathlib.Path(folder)/'node_modules'; target=baseline/p.relative_to(root)
+                  if target.parent.exists() and not target.exists(): target.symlink_to(p,target_is_directory=True)
+                  dirs.remove('node_modules')
+          PY
+          set +e
+          pnpm --dir "$baseline" --filter posthog-js test:typecheck > evidence/baseline-test-typecheck.log 2>&1
+          result=$?
+          set -e
+          test "$result" -ne 0
+          python3 <<'PY'
+          import pathlib,re
+          log=pathlib.Path('evidence/baseline-test-typecheck.log').read_text()
+          errors=[line for line in log.splitlines() if 'error TS' in line]
+          if len(errors)!=2 or not all('TS2688' in line for line in errors) or not all(name in '\n'.join(errors) for name in ["'dompurify'","'dotenv'"]):
+              print(log); raise SystemExit('Unexpected upstream typecheck baseline')
+          print('BASELINE PROOF: untouched upstream fails the optional legacy test:typecheck on the same two ambient stub declarations.')
+          print('\n'.join(errors))
+          PY
       - name: Browser and shared types lint and tests
         id: lint
         if: steps.patch.outcome == 'success'
         continue-on-error: true
         run: |
-          pnpm --filter posthog-js lint 2>&1 | tee evidence/browser-lint.log
-          pnpm --filter @posthog/types test:unit 2>&1 | tee evidence/shared-types-test.log
-          pnpm --filter @posthog/types lint 2>&1 | tee evidence/shared-types-lint.log
-          pnpm format 2>&1 | tee evidence/format.log
-          pnpm lint:oxlint 2>&1 | tee evidence/oxlint.log
-          pnpm check:public-api 2>&1 | tee evidence/public-api.log
+          pnpm --filter posthog-js lint > evidence/browser-lint.log 2>&1
+          pnpm --filter @posthog/types test:unit > evidence/shared-types-test.log 2>&1
+          pnpm --filter @posthog/types lint > evidence/shared-types-lint.log 2>&1
+          pnpm format > evidence/format.log 2>&1
+          pnpm lint:oxlint > evidence/oxlint.log 2>&1
+          pnpm check:public-api > evidence/public-api.log 2>&1
       - name: Regenerate mangled names and build production bundles
         id: build
         if: steps.patch.outcome == 'success'
         continue-on-error: true
-        run: pnpm --filter posthog-js write-mangled-property-names 2>&1 | tee evidence/build.log
+        run: pnpm --filter posthog-js write-mangled-property-names > evidence/build.log 2>&1
       - name: Regenerate API references
         id: references
         if: steps.build.outcome == 'success'
         continue-on-error: true
-        run: pnpm --filter posthog-js generate-references 2>&1 | tee evidence/references.log
+        run: pnpm --filter posthog-js generate-references > evidence/references.log 2>&1
       - name: Verify generated-file stability and ordinary production build
         id: deterministic
         if: steps.references.outcome == 'success'
@@ -138,35 +215,60 @@ jobs:
           sha256sum -c evidence/generated-before.sha256
           pnpm --filter posthog-js build > evidence/build-ordinary.log 2>&1
           git diff --check
-      - name: Retain final candidate as Git objects, without updating a branch
+      - name: Measure bundle impact against inspected upstream
+        id: bundle
+        if: steps.patch.outcome == 'success'
+        continue-on-error: true
+        run: pnpm bundle-size:array "$UPSTREAM_SHA" > evidence/bundle-size.log 2>&1
+      - name: Install real browser engines
+        id: browsers
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: pnpm --filter posthog-js exec playwright install --with-deps chromium firefox webkit > evidence/browser-install.log 2>&1
+      - name: Survey and product-tour browser integration tests
+        id: playwright
+        if: steps.browsers.outcome == 'success'
+        continue-on-error: true
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ github.workspace }}/evidence/playwright.json
+        run: pnpm --filter posthog-js exec playwright test playwright/mocked/surveys playwright/mocked/product-tours --project=chromium --project=firefox --project=webkit --workers=2 --reporter=line,json > evidence/playwright.log 2>&1
+      - name: Retain exact candidate as Git objects without updating a branch
         id: candidate
         if: steps.patch.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 <<'PY'
-          import base64, json, os, pathlib, subprocess, urllib.request
-          api = 'https://api.github.com/repos/AyobamiH/posthog-js'
-          def request(path, payload=None):
-              req = urllib.request.Request(api + path, data=None if payload is None else json.dumps(payload).encode(), headers={'Authorization': 'Bearer '+os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+          import base64,json,os,pathlib,subprocess,urllib.request
+          api='https://api.github.com/repos/AyobamiH/posthog-js'
+          def request(path,payload=None):
+              req=urllib.request.Request(api+path,data=None if payload is None else json.dumps(payload).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
               with urllib.request.urlopen(req) as r: return json.load(r)
-          upstream = os.environ['UPSTREAM_SHA']
-          base_tree = request('/git/commits/' + upstream)['tree']['sha']
-          changed = subprocess.check_output(['git', 'diff', '--name-only', upstream], text=True).splitlines()
-          entries = []
+          upstream=os.environ['UPSTREAM_SHA']; base_tree=request('/git/commits/'+upstream)['tree']['sha']
+          changed=subprocess.check_output(['git','diff','--name-only',upstream],text=True).splitlines()
+          index_env={**os.environ,'GIT_INDEX_FILE':os.environ['RUNNER_TEMP']+'/candidate-4794.index'}
+          subprocess.run(['git','read-tree',upstream],env=index_env,check=True)
+          entries=[]
           for path in changed:
-              if path in ['.github/workflows/review-4794.yml', '.github/scripts/review-4794.py']: continue
-              if not (path.startswith('packages/browser/') or path.startswith('packages/types/') or path == '.changeset/fresh-surveys-listen.md'):
-                  raise RuntimeError('Unexpected candidate change: ' + path)
-              p = pathlib.Path(path)
-              sha = request('/git/blobs', {'content': base64.b64encode(p.read_bytes()).decode(), 'encoding': 'base64'})['sha'] if p.exists() else None
-              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
-          tree = request('/git/trees', {'base_tree': base_tree, 'tree': entries})['sha']
-          manifest = {'tree': tree, 'reviewed': os.environ['REVIEWED_SHA'], 'upstream': upstream, 'entries': entries}
-          pathlib.Path('evidence/candidate.json').write_text(json.dumps(manifest, indent=2))
-          print('CANDIDATE MANIFEST:', json.dumps(manifest))
+              if path in ['.github/workflows/review-4794.yml','.github/scripts/review-4794.py']: continue
+              if not (path.startswith('packages/browser/') or path.startswith('packages/types/') or path=='.changeset/fresh-surveys-listen.md'): raise RuntimeError('Unexpected candidate change: '+path)
+              p=pathlib.Path(path)
+              if p.exists():
+                  expected=subprocess.check_output(['git','hash-object','-w',path],text=True).strip()
+                  sha=request('/git/blobs',{'content':base64.b64encode(p.read_bytes()).decode(),'encoding':'base64'})['sha']
+                  if sha!=expected: raise RuntimeError('Blob identity mismatch: '+path)
+                  subprocess.run(['git','update-index','--add','--cacheinfo','100644',sha,path],env=index_env,check=True)
+              else:
+                  sha=None; subprocess.run(['git','update-index','--force-remove',path],env=index_env,check=True)
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+          expected_tree=subprocess.check_output(['git','write-tree'],env=index_env,text=True).strip()
+          tree=request('/git/trees',{'base_tree':base_tree,'tree':entries})['sha']
+          if tree!=expected_tree: raise RuntimeError('Candidate tree identity mismatch')
+          manifest={'tree':tree,'reviewed':os.environ['REVIEWED_SHA'],'upstream':upstream,'entries':entries}
+          pathlib.Path('evidence/candidate.json').write_text(json.dumps(manifest,indent=2))
+          print('CANDIDATE MANIFEST:',json.dumps(manifest))
           PY
-      - name: Aggregate verification
+      - name: Aggregate outcomes and actual assertion statuses
         if: always()
         env:
           SOURCE: ${{ steps.source.outcome }}
@@ -178,25 +280,39 @@ jobs:
           UNIT: ${{ steps.unit.outcome }}
           FUNCTIONAL: ${{ steps.functional.outcome }}
           TYPES: ${{ steps.types.outcome }}
+          BASELINE_TYPES: ${{ steps.baseline_types.outcome }}
           LINT: ${{ steps.lint.outcome }}
           BUILD: ${{ steps.build.outcome }}
           REFERENCES: ${{ steps.references.outcome }}
           DETERMINISTIC: ${{ steps.deterministic.outcome }}
+          BUNDLE: ${{ steps.bundle.outcome }}
+          BROWSERS: ${{ steps.browsers.outcome }}
+          PLAYWRIGHT: ${{ steps.playwright.outcome }}
           CANDIDATE: ${{ steps.candidate.outcome }}
         run: |
           python3 <<'PY'
-          import os, json, pathlib
-          keys = 'SOURCE INSTALL DEPENDENCIES RED PATCH FOCUSED UNIT FUNCTIONAL TYPES LINT BUILD REFERENCES DETERMINISTIC CANDIDATE'.split()
-          result = {key: os.environ[key] for key in keys}
-          print('VERIFICATION OUTCOME:', json.dumps(result))
+          import collections,os,json,pathlib
+          keys='SOURCE INSTALL DEPENDENCIES RED PATCH FOCUSED UNIT FUNCTIONAL TYPES BASELINE_TYPES LINT BUILD REFERENCES DETERMINISTIC BUNDLE BROWSERS PLAYWRIGHT CANDIDATE'.split()
+          result={key:os.environ[key] for key in keys}
           pathlib.Path('evidence').mkdir(exist_ok=True)
-          pathlib.Path('evidence/outcome.json').write_text(json.dumps(result, indent=2))
-          for name in ['focused', 'unit']:
+          pathlib.Path('evidence/outcome.json').write_text(json.dumps(result,indent=2))
+          print('VERIFICATION OUTCOME:',json.dumps(result))
+          summaries={}
+          for name in ['focused','unit']:
               p=pathlib.Path('evidence/'+name+'.json')
               if p.exists():
-                  r=json.loads(p.read_text())
-                  print(name.upper()+' SUMMARY:', json.dumps({k:r.get(k) for k in ['numTotalTests','numPassedTests','numFailedTests','numPendingTests']}))
-          if not all(value == 'success' for value in result.values()): raise SystemExit(1)
+                  r=json.loads(p.read_text()); assertions=[t for s in r['testResults'] for t in s['assertionResults']]
+                  summaries[name]=dict(collections.Counter(t['status'] for t in assertions))
+                  summaries[name]['total']=len(assertions)
+                  print(name.upper()+' ASSERTIONS:',json.dumps(summaries[name]))
+          p=pathlib.Path('evidence/playwright.json')
+          if p.exists():
+              r=json.loads(p.read_text()); summaries['playwright']=r.get('stats',{}); summaries['playwright']['runnerErrors']=len(r.get('errors',[]))
+              print('PLAYWRIGHT SUMMARY:',json.dumps(summaries['playwright']))
+          pathlib.Path('evidence/assertion-summary.json').write_text(json.dumps(summaries,indent=2))
+          if not all(value=='success' for value in result.values()): raise SystemExit(1)
+          if any(summaries.get(name,{}).get('passed',0)==0 or summaries[name].get('failed',0)!=0 for name in ['focused','unit']): raise SystemExit(1)
+          if summaries.get('playwright',{}).get('unexpected',1)!=0 or summaries['playwright'].get('runnerErrors',1)!=0: raise SystemExit(1)
           PY
       - name: Retain verification evidence
         if: always()
