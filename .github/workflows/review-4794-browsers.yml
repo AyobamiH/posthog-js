@@ -1,0 +1,153 @@
+name: PR 4794 compiled subscription proof
+
+on:
+  push:
+    branches: [work/4794-browser-verification]
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: review-4794-compiled-browser
+  cancel-in-progress: true
+
+env:
+  CI: true
+  HUSKY: 0
+  PREK: 0
+  TURBO_TELEMETRY_DISABLED: 1
+  NODE_OPTIONS: --max-old-space-size=6144
+  UPSTREAM_SHA: 71ec4636e54203f50a464d20e03fd98bcd63e538
+  REVIEWED_SHA: 26539d0055c9c5a17b3a0f87521ffe8b52dd7c6b
+
+jobs:
+  verify:
+    if: github.repository == 'AyobamiH/posthog-js'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare the same inspected upstream integration
+        run: |
+          mkdir -p evidence
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch https://github.com/PostHog/posthog-js.git "$UPSTREAM_SHA"
+          git merge --no-commit --no-ff "$UPSTREAM_SHA"
+          git commit -m 'Prepare compiled subscription verification workspace'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - name: Install and build dependencies
+        run: |
+          pnpm install --frozen-lockfile > evidence/install.log 2>&1
+          pnpm turbo build --filter='posthog-js^...' --concurrency=2 > evidence/dependencies.log 2>&1
+      - name: Reuse the reviewed patch and format the new browser regression
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          text=Path('.github/workflows/review-4794.yml').read_text()
+          start=text.index('      - name: Apply bounded review fixes and align the public callback contract')
+          end=text.index('\n      - name:',start+1)
+          lines=text[start:end].splitlines()
+          command=next(i for i,line in enumerate(lines) if line.strip()=='run: |')
+          script='\n'.join(line[10:] if line.startswith(' '*10) else line for line in lines[command+1:])+'\n'
+          Path('evidence/apply-reviewed-patch.sh').write_text('set -euo pipefail\n'+script)
+          PY
+          bash evidence/apply-reviewed-patch.sh > evidence/patch.log 2>&1
+          python3 <<'PY'
+          from pathlib import Path
+          Path('.changeset/fresh-surveys-listen.md').write_text("---\n'posthog-js': minor\n'@posthog/types': minor\n---\n\nAdd `onActiveMatchingSurveysChanged` to subscribe to survey eligibility updates with safe unsubscribe and recoverable load-error reporting.\n")
+          PY
+          pnpm exec oxfmt --write packages/browser/playwright/mocked/surveys/active-matching-subscription.spec.ts > evidence/browser-format.log 2>&1
+          pnpm --filter posthog-js lint > evidence/lint.log 2>&1
+          pnpm format > evidence/format.log 2>&1
+          pnpm check:public-api > evidence/public-api.log 2>&1
+          git diff --check
+      - name: Build actual minified SDK and regenerate references
+        id: build
+        run: |
+          pnpm --filter posthog-js write-mangled-property-names > evidence/build.log 2>&1
+          pnpm --filter posthog-js generate-references > evidence/references.log 2>&1
+      - name: Install browser engines
+        run: pnpm --filter posthog-js exec playwright install --with-deps chromium firefox webkit > evidence/browser-install.log 2>&1
+      - name: Exercise the compiled public API without retries
+        id: browser
+        continue-on-error: true
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ github.workspace }}/evidence/playwright.json
+        run: pnpm --filter posthog-js exec playwright test playwright/mocked/surveys/active-matching-subscription.spec.ts --project=chromium --project=firefox --project=webkit --workers=2 --retries=0 --reporter=line,json > evidence/playwright.log 2>&1
+      - name: Retain the exact tested tree without updating any branch
+        id: candidate
+        if: steps.build.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 <<'PY'
+          import base64,json,os,pathlib,subprocess,urllib.request
+          api='https://api.github.com/repos/AyobamiH/posthog-js'
+          def request(path,payload=None):
+              req=urllib.request.Request(api+path,data=None if payload is None else json.dumps(payload).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req) as response: return json.load(response)
+          upstream=os.environ['UPSTREAM_SHA']; base_tree=request('/git/commits/'+upstream)['tree']['sha']
+          changed=subprocess.check_output(['git','diff','--name-only',upstream],text=True).splitlines()
+          index_env={**os.environ,'GIT_INDEX_FILE':os.environ['RUNNER_TEMP']+'/compiled-4794.index'}
+          subprocess.run(['git','read-tree',upstream],env=index_env,check=True)
+          entries=[]
+          excluded=['.github/workflows/review-4794.yml','.github/workflows/review-4794-browsers.yml','.github/scripts/review-4794.py']
+          for path in changed:
+              if path in excluded: continue
+              if not (path.startswith('packages/browser/') or path.startswith('packages/types/') or path=='.changeset/fresh-surveys-listen.md'): raise RuntimeError('Unexpected candidate change: '+path)
+              p=pathlib.Path(path)
+              expected=subprocess.check_output(['git','hash-object','-w',path],text=True).strip()
+              sha=request('/git/blobs',{'content':base64.b64encode(p.read_bytes()).decode(),'encoding':'base64'})['sha']
+              if sha!=expected: raise RuntimeError('Blob identity mismatch: '+path)
+              subprocess.run(['git','update-index','--add','--cacheinfo','100644',sha,path],env=index_env,check=True)
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+          expected_tree=subprocess.check_output(['git','write-tree'],env=index_env,text=True).strip()
+          tree=request('/git/trees',{'base_tree':base_tree,'tree':entries})['sha']
+          if tree!=expected_tree: raise RuntimeError('Candidate tree identity mismatch')
+          manifest={'tree':tree,'reviewed':os.environ['REVIEWED_SHA'],'upstream':upstream,'entries':entries}
+          pathlib.Path('evidence/candidate.json').write_text(json.dumps(manifest,indent=2))
+          print('CANDIDATE MANIFEST:',json.dumps(manifest))
+          PY
+      - name: Check actual browser outcomes
+        if: always()
+        env:
+          BROWSER: ${{ steps.browser.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          CANDIDATE: ${{ steps.candidate.outcome }}
+        run: |
+          python3 <<'PY'
+          import json,os,pathlib
+          outcome={key:os.environ[key] for key in ['BUILD','BROWSER','CANDIDATE']}
+          pathlib.Path('evidence').mkdir(exist_ok=True)
+          pathlib.Path('evidence/outcome.json').write_text(json.dumps(outcome,indent=2))
+          print('OUTCOMES:',json.dumps(outcome))
+          p=pathlib.Path('evidence/playwright.json')
+          if not p.exists(): raise SystemExit('Missing browser report')
+          report=json.loads(p.read_text()); summary=report.get('stats',{})
+          summary['runnerErrors']=len(report.get('errors',[]))
+          pathlib.Path('evidence/assertion-summary.json').write_text(json.dumps(summary,indent=2))
+          print('BROWSER ASSERTIONS:',json.dumps(summary))
+          if not all(value=='success' for value in outcome.values()) or summary.get('expected')!=9 or summary.get('unexpected')!=0 or summary.get('flaky')!=0 or summary.get('skipped')!=0 or summary['runnerErrors']!=0: raise SystemExit(1)
+          PY
+      - name: Retain browser proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-4794-compiled-browser-evidence
+          path: evidence/
+          retention-days: 30
