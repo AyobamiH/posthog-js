@@ -95,7 +95,13 @@ jobs:
           replace('packages/types/src/posthog.ts',before,after)
           after='\n'.join(['    onActiveMatchingSurveysChanged(','        callback: (surveys: any[], context?: { isLoaded: boolean; error?: string }) => void','    ): () => void'])
           replace('packages/types/src/posthog.ts','    onActiveMatchingSurveysChanged(callback: (surveys: any[]) => void): () => void',after)
-          p=Path('packages/browser/src/__tests__/active-matching-surveys.test.ts')
+          test_path='packages/browser/src/__tests__/active-matching-surveys.test.ts'
+          replace(test_path,'const actionSurvey: Survey = {','// Deliberately omit both event-condition keys to exercise action-only API payloads.\nconst actionSurvey = {')
+          replace(test_path,'\n}\n\nconst flushRequests','\n} as Survey\n\nconst flushRequests')
+          replace(test_path,'                register: vi.fn((properties) => Object.assign(state, properties)),','                register: vi.fn((properties) => { Object.assign(state, properties); return true }),')
+          replace(test_path,"} as PostHog['requestRouter'],","} as unknown as PostHog['requestRouter'],")
+          replace('packages/browser/src/__tests__/helpers/surveys-client.ts','    }) as Client','    }) as unknown as Client')
+          p=Path(test_path)
           text="import type { PostHog as PostHogInterface } from '@posthog/types'\n"+p.read_text()
           i=text.rfind('\n})')
           if i<0: raise RuntimeError('Missing test suite terminator')
@@ -113,7 +119,7 @@ jobs:
           '''+text[i:]
           p.write_text(text)
           PY
-          pnpm exec oxfmt --write packages/browser/src/posthog-surveys.ts packages/browser/src/browser-surveys.ts packages/browser/src/surveys-config.ts packages/browser/src/utils/event-receiver.ts packages/browser/src/posthog-core.ts packages/browser/src/__tests__/active-matching-surveys.test.ts packages/browser/src/__tests__/posthog-surveys.test.ts packages/types/src/posthog.ts
+          pnpm exec oxfmt --write packages/browser/src/posthog-surveys.ts packages/browser/src/browser-surveys.ts packages/browser/src/surveys-config.ts packages/browser/src/utils/event-receiver.ts packages/browser/src/posthog-core.ts packages/browser/src/__tests__/active-matching-surveys.test.ts packages/browser/src/__tests__/posthog-surveys.test.ts packages/browser/src/__tests__/helpers/surveys-client.ts packages/types/src/posthog.ts
           pnpm --filter @posthog/types build > evidence/shared-types-build.log 2>&1
           git diff --check
           git diff --stat "$UPSTREAM_SHA" | tee evidence/diff-stat.txt
@@ -121,11 +127,6 @@ jobs:
         id: focused
         continue-on-error: true
         run: pnpm --filter posthog-js exec vitest run src/__tests__/active-matching-surveys.test.ts src/__tests__/posthog-surveys.test.ts src/__tests__/surveys-extension.test.ts --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/focused.json" > evidence/focused.log 2>&1
-      - name: Full browser unit suite
-        id: unit
-        if: steps.patch.outcome == 'success'
-        continue-on-error: true
-        run: pnpm --filter posthog-js test:unit --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/unit.json" > evidence/unit.log 2>&1
       - name: Browser functional suite
         id: functional
         if: steps.patch.outcome == 'success'
@@ -163,7 +164,7 @@ jobs:
                   dirs.remove('node_modules')
           PY
           set +e
-          pnpm --dir "$baseline" --filter posthog-js test:typecheck > evidence/baseline-test-typecheck.log 2>&1
+          node "$GITHUB_WORKSPACE/node_modules/typescript/bin/tsc" --noEmit --project "$baseline/packages/browser/src/__tests__/tsconfig.json" > evidence/baseline-test-typecheck.log 2>&1
           result=$?
           set -e
           test "$result" -ne 0
@@ -189,9 +190,14 @@ jobs:
           pnpm check:public-api > evidence/public-api.log 2>&1
       - name: Regenerate mangled names and build production bundles
         id: build
-        if: steps.patch.outcome == 'success' && steps.focused.outcome == 'success' && steps.unit.outcome == 'success' && steps.types.outcome == 'success' && steps.lint.outcome == 'success' && steps.baseline_types.outcome == 'success'
+        if: steps.patch.outcome == 'success' && steps.focused.outcome == 'success' && steps.types.outcome == 'success' && steps.lint.outcome == 'success' && steps.baseline_types.outcome == 'success'
         continue-on-error: true
         run: pnpm --filter posthog-js write-mangled-property-names > evidence/build.log 2>&1
+      - name: Full browser unit suite including built entrypoints
+        id: unit
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: pnpm --filter posthog-js test:unit --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/unit.json" > evidence/unit.log 2>&1
       - name: Regenerate API references
         id: references
         if: steps.build.outcome == 'success'
@@ -199,7 +205,7 @@ jobs:
         run: pnpm --filter posthog-js generate-references > evidence/references.log 2>&1
       - name: Verify generated-file stability and ordinary production build
         id: deterministic
-        if: steps.references.outcome == 'success'
+        if: steps.references.outcome == 'success' && steps.unit.outcome == 'success'
         continue-on-error: true
         run: |
           sha256sum packages/browser/terser-mangled-names.json packages/browser/references/posthog-js-references-latest.json > evidence/generated-before.sha256
@@ -215,7 +221,7 @@ jobs:
         run: pnpm bundle-size:array "$UPSTREAM_SHA" > evidence/bundle-size.log 2>&1
       - name: Install real browser engines
         id: browsers
-        if: steps.build.outcome == 'success'
+        if: steps.build.outcome == 'success' && steps.unit.outcome == 'success'
         continue-on-error: true
         run: pnpm --filter posthog-js exec playwright install --with-deps chromium firefox webkit > evidence/browser-install.log 2>&1
       - name: Survey and product-tour browser integration tests
@@ -296,6 +302,7 @@ jobs:
               if p.exists():
                   r=json.loads(p.read_text()); assertions=[t for s in r['testResults'] for t in s['assertionResults']]
                   summaries[name]=dict(collections.Counter(t['status'] for t in assertions)); summaries[name]['total']=len(assertions)
+                  summaries[name]['failedSuites']=r['numFailedTestSuites']; summaries[name]['success']=r['success']
                   print(name.upper()+' ASSERTIONS:',json.dumps(summaries[name]))
           p=pathlib.Path('evidence/playwright.json')
           if p.exists():
@@ -303,7 +310,7 @@ jobs:
               print('PLAYWRIGHT SUMMARY:',json.dumps(summaries['playwright']))
           pathlib.Path('evidence/assertion-summary.json').write_text(json.dumps(summaries,indent=2))
           if not all(value=='success' for value in result.values()): raise SystemExit(1)
-          if any(summaries.get(name,{}).get('passed',0)==0 or summaries[name].get('failed',0)!=0 for name in ['focused','unit']): raise SystemExit(1)
+          if any(summaries.get(name,{}).get('passed',0)==0 or summaries[name].get('failed',0)!=0 or summaries[name].get('failedSuites',1)!=0 or not summaries[name].get('success') for name in ['focused','unit']): raise SystemExit(1)
           if summaries.get('playwright',{}).get('unexpected',1)!=0 or summaries['playwright'].get('runnerErrors',1)!=0: raise SystemExit(1)
           PY
       - name: Retain verification evidence
