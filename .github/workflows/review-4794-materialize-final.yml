@@ -1,0 +1,121 @@
+name: PR 4794 materialize final verified candidate
+
+on:
+  push:
+    branches: [work/4794-review-verification]
+
+permissions:
+  contents: write
+
+env:
+  CI: true
+  HUSKY: 0
+  PREK: 0
+  TURBO_TELEMETRY_DISABLED: 1
+  NODE_OPTIONS: --max-old-space-size=6144
+  UPSTREAM_SHA: 902cd32fe4deed4094f535ab91d713355b09a748
+  EXPECTED_MANGLED_SHA256: db7cf5e8a1fefda859500f885217693561c0149a8424aaff757ee6884d6d0678
+  EXPECTED_REFERENCES_SHA256: c548aed0aa05d4cff2dff52531ced3f5817158b9b4e201d03819bdbf5bc71abc
+
+jobs:
+  materialize:
+    if: github.repository == 'AyobamiH/posthog-js'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Integrate verified upstream
+        run: |
+          mkdir -p evidence
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch https://github.com/PostHog/posthog-js.git "$UPSTREAM_SHA"
+          git merge --no-commit --no-ff "$UPSTREAM_SHA"
+          git commit -m 'Prepare PR 4794 materialization workspace'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - name: Install workspace
+        run: pnpm install --frozen-lockfile > evidence/install.log 2>&1
+      - name: Build dependencies
+        run: pnpm turbo build --filter='posthog-js^...' --concurrency=2 > evidence/dependencies.log 2>&1
+      - name: Recreate verified source
+        run: |
+          python3 .github/scripts/review-4794.py
+          python3 .github/scripts/review-4794-followup.py
+          pnpm exec oxfmt --write \
+            packages/browser/src/posthog-surveys.ts \
+            packages/browser/src/browser-surveys.ts \
+            packages/browser/src/surveys-config.ts \
+            packages/browser/src/utils/event-receiver.ts \
+            packages/browser/src/posthog-core.ts \
+            packages/browser/src/__tests__/active-matching-surveys.test.ts \
+            packages/browser/src/__tests__/posthog-surveys.test.ts \
+            packages/browser/src/__tests__/surveys-extension.test.ts \
+            packages/types/src/posthog.ts \
+            packages/types/src/__tests__/posthog-interface.spec.ts
+          git diff --check
+      - name: Recreate exact verified generated state
+        run: |
+          # The final verified workspace generated these twice before the stable hashes were captured.
+          pnpm --filter posthog-js write-mangled-property-names > evidence/build-first.log 2>&1
+          pnpm --filter posthog-js generate-references > evidence/references-first.log 2>&1
+          pnpm --filter posthog-js write-mangled-property-names > evidence/build-second.log 2>&1
+          pnpm --filter posthog-js generate-references > evidence/references-second.log 2>&1
+          actual_mangled=$(sha256sum packages/browser/terser-mangled-names.json | awk '{print $1}')
+          actual_refs=$(sha256sum packages/browser/references/posthog-js-references-latest.json | awk '{print $1}')
+          printf 'mangled=%s\nreferences=%s\n' "$actual_mangled" "$actual_refs" | tee evidence/generated-hashes.txt
+          test "$actual_mangled" = "$EXPECTED_MANGLED_SHA256"
+          test "$actual_refs" = "$EXPECTED_REFERENCES_SHA256"
+      - name: Create GitHub candidate tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 <<'PY'
+          import base64, json, os, pathlib, subprocess, urllib.request
+          api='https://api.github.com/repos/AyobamiH/posthog-js'
+          def request(path,payload=None):
+              req=urllib.request.Request(api+path,data=None if payload is None else json.dumps(payload).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req) as r: return json.load(r)
+          upstream=os.environ['UPSTREAM_SHA']
+          base_tree=request('/git/commits/'+upstream)['tree']['sha']
+          changed=subprocess.check_output(['git','diff','--name-only',upstream],text=True).splitlines()
+          excluded={
+              '.github/workflows/review-4794.yml',
+              '.github/workflows/review-4794-final.yml',
+              '.github/workflows/review-4794-materialize.yml',
+              '.github/workflows/review-4794-materialize-final.yml',
+              '.github/scripts/review-4794.py',
+              '.github/scripts/review-4794-followup.py',
+          }
+          entries=[]
+          for path in changed:
+              if path in excluded:
+                  continue
+              if not (path.startswith('packages/browser/') or path.startswith('packages/types/') or path=='.changeset/fresh-surveys-listen.md'):
+                  raise RuntimeError('Unexpected candidate path: '+path)
+              p=pathlib.Path(path)
+              if not p.exists():
+                  entries.append({'path':path,'mode':'100644','type':'blob','sha':None})
+                  continue
+              blob=request('/git/blobs',{'content':base64.b64encode(p.read_bytes()).decode(),'encoding':'base64'})['sha']
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':blob})
+          created=request('/git/trees',{'base_tree':base_tree,'tree':entries})
+          manifest={'tree':created['sha'],'upstream':upstream,'entries':entries}
+          pathlib.Path('evidence/candidate.json').write_text(json.dumps(manifest,indent=2))
+          print(json.dumps(manifest))
+          PY
+      - name: Upload candidate evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-4794-final-candidate
+          path: evidence/
+          retention-days: 30
