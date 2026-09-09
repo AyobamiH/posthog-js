@@ -117,7 +117,6 @@ jobs:
               req=urllib.request.Request(api+path,data=None if payload is None else json.dumps(payload).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
               with urllib.request.urlopen(req) as r: return json.load(r)
           upstream=os.environ['UPSTREAM_SHA']
-          base_tree=request('/git/commits/'+upstream)['tree']['sha']
           changed=subprocess.check_output(['git','diff','--name-only',upstream],text=True).splitlines()
           index_env={**os.environ,'GIT_INDEX_FILE':os.environ['RUNNER_TEMP']+'/candidate.index'}
           subprocess.run(['git','read-tree',upstream],env=index_env,check=True)
@@ -133,9 +132,12 @@ jobs:
                   subprocess.run(['git','update-index','--force-remove',path],env=index_env,check=True)
                   entries.append({'path':path,'sha':None})
                   continue
-              sha=request('/git/blobs',{'content':base64.b64encode(p.read_bytes()).decode(),'encoding':'base64'})['sha']
-              subprocess.run(['git','update-index','--add','--cacheinfo','100644',sha,path],env=index_env,check=True)
-              entries.append({'path':path,'sha':sha})
+              local_sha=subprocess.check_output(['git','hash-object','-w',path],text=True).strip()
+              remote_sha=request('/git/blobs',{'content':base64.b64encode(p.read_bytes()).decode(),'encoding':'base64'})['sha']
+              if local_sha != remote_sha:
+                  raise RuntimeError('Blob identity mismatch: '+path)
+              subprocess.run(['git','update-index','--add','--cacheinfo','100644',local_sha,path],env=index_env,check=True)
+              entries.append({'path':path,'sha':local_sha})
           tree=subprocess.check_output(['git','write-tree'],env=index_env,text=True).strip()
           manifest={'tree':tree,'upstream':upstream,'entries':entries}
           pathlib.Path('evidence/candidate.json').write_text(json.dumps(manifest,indent=2))
