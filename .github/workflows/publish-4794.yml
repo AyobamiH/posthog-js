@@ -1,0 +1,29 @@
+name: Publish PR 4794 as AyobamiH
+
+on:
+  push:
+    branches: [work/4794-review-verification]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.repository == 'AyobamiH/posthog-js'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/1498-active-matching-surveys-subscription
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Sync verified candidate with current upstream and publish
+        run: |
+          set -euo pipefail
+          git config user.name 'AyobamiH'
+          git config user.email '47716486+AyobamiH@users.noreply.github.com'
+          git fetch https://github.com/PostHog/posthog-js.git 902cd32fe4deed4094f535ab91d713355b09a748
+          git merge --no-ff 902cd32fe4deed4094f535ab91d713355b09a748 -m 'chore: sync PR #4794 with upstream main'
+          test "$(git show -s --format='%an <%ae>' HEAD)" = 'AyobamiH <47716486+AyobamiH@users.noreply.github.com>'
+          test "$(git show -s --format='%cn <%ce>' HEAD)" = 'AyobamiH <47716486+AyobamiH@users.noreply.github.com>'
+          git push origin HEAD:feat/1498-active-matching-surveys-subscription
