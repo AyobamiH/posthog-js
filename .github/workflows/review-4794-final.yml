@@ -1,0 +1,161 @@
+name: PR 4794 final maintainer verification
+
+on:
+  push:
+    branches: [work/4794-review-verification]
+
+permissions:
+  contents: write
+
+env:
+  CI: true
+  HUSKY: 0
+  PREK: 0
+  TURBO_TELEMETRY_DISABLED: 1
+  NODE_OPTIONS: --max-old-space-size=6144
+  UPSTREAM_SHA: 902cd32fe4deed4094f535ab91d713355b09a748
+
+jobs:
+  verify:
+    if: github.repository == 'AyobamiH/posthog-js'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Integrate current upstream
+        run: |
+          mkdir -p evidence
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch https://github.com/PostHog/posthog-js.git "$UPSTREAM_SHA"
+          git merge --no-commit --no-ff "$UPSTREAM_SHA"
+          git commit -m 'Prepare PR 4794 final verification workspace'
+          git rev-parse HEAD | tee evidence/source.txt
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - name: Install frozen workspace
+        run: pnpm install --frozen-lockfile > evidence/install.log 2>&1
+      - name: Build browser dependencies
+        run: pnpm turbo build --filter='posthog-js^...' --concurrency=2 > evidence/dependencies.log 2>&1
+      - name: Apply reviewed fixes
+        id: patch
+        run: |
+          python3 .github/scripts/review-4794.py
+          python3 .github/scripts/review-4794-followup.py
+          pnpm exec oxfmt --write \
+            packages/browser/src/posthog-surveys.ts \
+            packages/browser/src/browser-surveys.ts \
+            packages/browser/src/surveys-config.ts \
+            packages/browser/src/utils/event-receiver.ts \
+            packages/browser/src/posthog-core.ts \
+            packages/browser/src/__tests__/active-matching-surveys.test.ts \
+            packages/browser/src/__tests__/posthog-surveys.test.ts \
+            packages/browser/src/__tests__/surveys-extension.test.ts \
+            packages/types/src/posthog.ts \
+            packages/types/src/__tests__/posthog-interface.spec.ts
+          git diff --check
+          git diff --stat "$UPSTREAM_SHA" | tee evidence/diff-stat.txt
+      - name: Focused regression suite
+        id: focused
+        run: pnpm --filter posthog-js exec vitest run src/__tests__/active-matching-surveys.test.ts src/__tests__/posthog-surveys.test.ts src/__tests__/surveys-extension.test.ts --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/focused.json" > evidence/focused.log 2>&1
+      - name: Shared public types
+        id: public_types
+        run: |
+          pnpm --filter @posthog/types test:unit > evidence/shared-types-test.log 2>&1
+          pnpm --filter @posthog/types lint > evidence/shared-types-lint.log 2>&1
+          pnpm --filter @posthog/types build > evidence/shared-types-build.log 2>&1
+      - name: Browser production typecheck and lint
+        id: quality
+        run: |
+          pnpm --filter posthog-js typecheck > evidence/typecheck.log 2>&1
+          pnpm --filter posthog-js lint > evidence/browser-lint.log 2>&1
+          pnpm format > evidence/format.log 2>&1
+          pnpm lint:oxlint > evidence/oxlint.log 2>&1
+          pnpm check:public-api > evidence/public-api.log 2>&1
+      - name: Generate mangled names and production bundles
+        id: build
+        run: pnpm --filter posthog-js write-mangled-property-names > evidence/build.log 2>&1
+      - name: Full browser unit suite
+        id: unit
+        run: pnpm --filter posthog-js test:unit --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/unit.json" > evidence/unit.log 2>&1
+      - name: Browser functional suite
+        id: functional
+        run: pnpm --filter posthog-js test:functional > evidence/functional.log 2>&1
+      - name: Generate API references
+        id: references
+        run: pnpm --filter posthog-js generate-references > evidence/references.log 2>&1
+      - name: Verify generators are deterministic
+        id: deterministic
+        run: |
+          sha256sum packages/browser/terser-mangled-names.json packages/browser/references/posthog-js-references-latest.json > evidence/generated-before.sha256
+          pnpm --filter posthog-js write-mangled-property-names > evidence/build-second.log 2>&1
+          pnpm --filter posthog-js generate-references > evidence/references-second.log 2>&1
+          sha256sum -c evidence/generated-before.sha256
+          pnpm --filter posthog-js build > evidence/build-ordinary.log 2>&1
+          git diff --check
+      - name: Bundle-size comparison
+        id: bundle
+        run: pnpm bundle-size:array "$UPSTREAM_SHA" > evidence/bundle-size.log 2>&1
+      - name: Create exact candidate tree
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 <<'PY'
+          import base64, json, os, pathlib, subprocess, urllib.request
+          api='https://api.github.com/repos/AyobamiH/posthog-js'
+          def request(path,payload=None):
+              req=urllib.request.Request(api+path,data=None if payload is None else json.dumps(payload).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req) as r: return json.load(r)
+          upstream=os.environ['UPSTREAM_SHA']
+          base_tree=request('/git/commits/'+upstream)['tree']['sha']
+          changed=subprocess.check_output(['git','diff','--name-only',upstream],text=True).splitlines()
+          index_env={**os.environ,'GIT_INDEX_FILE':os.environ['RUNNER_TEMP']+'/candidate.index'}
+          subprocess.run(['git','read-tree',upstream],env=index_env,check=True)
+          entries=[]
+          excluded={'.github/workflows/review-4794.yml','.github/workflows/review-4794-final.yml','.github/scripts/review-4794.py','.github/scripts/review-4794-followup.py'}
+          for path in changed:
+              if path in excluded:
+                  continue
+              if not (path.startswith('packages/browser/') or path.startswith('packages/types/') or path=='.changeset/fresh-surveys-listen.md'):
+                  raise RuntimeError('Unexpected candidate path: '+path)
+              p=pathlib.Path(path)
+              if not p.exists():
+                  subprocess.run(['git','update-index','--force-remove',path],env=index_env,check=True)
+                  entries.append({'path':path,'sha':None})
+                  continue
+              sha=request('/git/blobs',{'content':base64.b64encode(p.read_bytes()).decode(),'encoding':'base64'})['sha']
+              subprocess.run(['git','update-index','--add','--cacheinfo','100644',sha,path],env=index_env,check=True)
+              entries.append({'path':path,'sha':sha})
+          tree=subprocess.check_output(['git','write-tree'],env=index_env,text=True).strip()
+          manifest={'tree':tree,'upstream':upstream,'entries':entries}
+          pathlib.Path('evidence/candidate.json').write_text(json.dumps(manifest,indent=2))
+          print(json.dumps(manifest))
+          PY
+      - name: Final gate
+        run: |
+          node <<'JS'
+          const fs=require('fs')
+          for (const name of ['focused','unit']) {
+            const r=JSON.parse(fs.readFileSync(`evidence/${name}.json`,'utf8'))
+            if (r.numFailedTests !== 0 || r.numPendingTests !== 0) throw new Error(`${name} not fully green`)
+            console.log(name, {total:r.numTotalTests, passed:r.numPassedTests, failed:r.numFailedTests, pending:r.numPendingTests})
+          }
+          JS
+          test -s evidence/candidate.json
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-4794-final-evidence
+          path: evidence/
+          retention-days: 30
