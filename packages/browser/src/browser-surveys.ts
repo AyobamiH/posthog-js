@@ -3,6 +3,7 @@ import { isUndefined } from '@posthog/core'
 
 import type { PostHog } from './posthog-core'
 import { PostHogSurveys } from './posthog-surveys'
+import { SurveyEventName } from './posthog-surveys-types'
 import { extendURLParams } from './request'
 import type { SurveysConfig, SurveysConfigSource, SurveysExtensionHost } from './surveys-config'
 import type { Properties, QueuedRequestWithOptions } from './types'
@@ -93,7 +94,14 @@ class BrowserSurveysConfigSource implements SurveysConfigSource {
 
     onMatchingConditionsChanged(callback: () => void): () => void {
         const unsubscribeCapture = this._instance._addCaptureHook((event) => {
-            if (event === '$pageview') {
+            // Capture hooks run from `eventCaptured`, after `PostHog.capture` has applied
+            // survey seen-state for dismissal/submission lifecycle events. Re-evaluate here
+            // so untargeted surveys are removed immediately as well as event/action surveys.
+            if (
+                event === '$pageview' ||
+                event === SurveyEventName.DISMISSED ||
+                event === SurveyEventName.SENT
+            ) {
                 callback()
             }
         })
