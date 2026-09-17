@@ -1,3 +1,5 @@
+import { isArray } from '@posthog/core'
+
 import { BrowserSurveys } from '../browser-surveys'
 import { SURVEYS } from '../constants'
 import { SurveyManager } from '../extensions/surveys'
@@ -46,7 +48,7 @@ describe('active matching survey subscription lifecycle consumption', () => {
                     return true
                 }),
                 unregister: vi.fn((key) => {
-                    if (Array.isArray(key)) {
+                    if (isArray(key)) {
                         key.forEach((item) => delete state[item])
                     } else {
                         delete state[key as string]
