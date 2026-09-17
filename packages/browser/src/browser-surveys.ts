@@ -97,11 +97,7 @@ class BrowserSurveysConfigSource implements SurveysConfigSource {
             // Capture hooks run from `eventCaptured`, after `PostHog.capture` has applied
             // survey seen-state for dismissal/submission lifecycle events. Re-evaluate here
             // so untargeted surveys are removed immediately as well as event/action surveys.
-            if (
-                event === '$pageview' ||
-                event === SurveyEventName.DISMISSED ||
-                event === SurveyEventName.SENT
-            ) {
+            if (event === '$pageview' || event === SurveyEventName.DISMISSED || event === SurveyEventName.SENT) {
                 callback()
             }
         })
